@@ -1,33 +1,48 @@
+{-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE MultiWayIf          #-}
+{-# LANGUAGE NamedFieldPuns      #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications    #-}
+{-# LANGUAGE TupleSections       #-}
+
 module Main (main) where
 
+import           Cabal.Plan
 import           Control.Applicative
-import           Control.Concurrent    (getNumCapabilities)
+import           Control.Concurrent                (getNumCapabilities)
 import           Control.Exception
 import           Control.Monad
+import           Data.Bifunctor
+import           Data.Either
+import           Data.Functor
 import           Data.List
+import           Data.Map.Strict                   (Map)
+import qualified Data.Map.Strict                   as M
 import           Data.Maybe
-import           Data.Set              (Set)
-import qualified Data.Set              as Set
-import           Data.Text             (Text, pack, unpack)
-import qualified Data.Text             as Text
-import qualified Data.Text.IO          as Text
-import           Data.Version          (showVersion)
+import           Data.Set                          (Set)
+import qualified Data.Set                          as Set
+import           Data.Text                         (Text, pack, unpack)
+import qualified Data.Text                         as Text
+import qualified Data.Text.Encoding                as Text
+import qualified Data.Text.IO                      as Text
+import           Data.Version                      (showVersion)
+import           Distribution.InstalledPackageInfo (InstalledPackageInfo (..),
+                                                    parseInstalledPackageInfo)
+import           Distribution.Pretty
+import           Distribution.Types.ExposedModule
+import           GHC.IsList
 import           Numeric.Natural
 import           Options.Applicative
-import qualified Paths_haskdogs        as Paths
-import           Prelude               hiding (log)
+import qualified Paths_haskdogs                    as Paths
+import           Prelude                           hiding (log)
 import           System.Directory
-import           System.Exit           (ExitCode (..))
+import           System.Exit                       (ExitCode (..))
 import           System.FilePath
 import           System.IO
 import           System.Log.FastLogger
-import           System.Process.Text   (readProcessWithExitCode)
-import           UnliftIO              (pooledMapConcurrentlyN)
+import           System.Process.Text               (readProcessWithExitCode)
+import           UnliftIO                          (pooledMapConcurrentlyN)
 
 {-
   ___        _   _
@@ -111,7 +126,7 @@ optsParser def_deps_dir def_concurrency = Opts
         short 'n' <>
         metavar "NUM" <>
         value def_concurrency <>
-        help ("Limit number of ghc-pkg processes running at the same time. The default is [" <> show def_concurrency <>"]"))
+        help ("Limit number of processes running at the same time. The default is [" <> show def_concurrency <>"]"))
   <*> flag True False (
         long "quiet" <>
         short 'q' <>
@@ -227,6 +242,23 @@ main = withFastLogger1 (LogStdout 64) $ \logStdout -> withFastLogger1 (LogStderr
           (False,True)  -> go OFF
           (False,False) -> fail "Either `stack` or `cabal` should be installed"
 
+    dump_ghc_pkgs_db = runp_ghc_pkgs ["--simple-output", "dump"]
+
+    load_ghc_pkgs_db :: IO (Map Text Text)
+    load_ghc_pkgs_db = do
+      (_, dump) <- dump_ghc_pkgs_db
+      let
+        (failures, pkgs) = partitionEithers . map (parseInstalledPackageInfo . Text.encodeUtf8) $ Text.splitOn "---\n" dump
+        zipVersion InstalledPackageInfo{sourcePackageId, exposedModules} = (,prettyShow sourcePackageId) <$> exposedModules
+        dropReexports = filter (isNothing . exposedReexport . fst)
+        modsPkgs = map (bimap (Text.pack . prettyShow . exposedName) Text.pack) . dropReexports . join $ map (zipVersion . snd) pkgs
+        packagesMap = fromList modsPkgs :: Map Text Text
+
+      unless (null failures) $
+        eprint . intercalate "\n" $ "encountered failures when reading ghc-pkg database:\n" : (("\t\t" <>) <$> (toList =<< failures)) ++ ["\n"]
+
+      pure packagesMap
+
     cabal_or_stack = go cli_use_stack where
       go ON = "stack"
       go OFF = "cabal"
@@ -258,36 +290,84 @@ main = withFastLogger1 (LogStdout 64) $ \logStdout -> withFastLogger1 (LogStderr
       fmap concat . mapM (fmap (mapMaybe grepImports) . readLinedFile . unpack) $ Set.toList files
 
     -- Maps import name to haskell package name
-    iname2module :: Text -> IO (Maybe Text)
-    iname2module iname = do
-      (logLine, cmdOut) <- runp_ghc_pkgs ["--simple-output", "find-module", unpack iname]
-      let mod' = listToMaybe $ Text.words cmdOut
-      vprint $ logLine <> "\nImport " <> unpack iname <> " resolved to " <> maybe "NULL" unpack mod'
+    iname2module :: Map Text Text -> Text -> IO (Maybe Text)
+    iname2module modulesDb iname = do
+      let mod' = M.lookup iname modulesDb
+      vprint $ "Import " <> unpack iname <> " resolved to " <> maybe "NULL" unpack mod'
       pure mod'
 
-    inames2modules :: [Text] -> IO [FilePath]
-    inames2modules inames = do
-      map unpack . nub . sort . catMaybes <$> pooledMapConcurrentlyN (fromIntegral cli_limit_concurrency) iname2module (nub inames)
+    inames2modules :: Map Text Text -> [Text] -> IO [FilePath]
+    inames2modules modulesDb inames = do
+      map unpack . nub . sort . catMaybes <$> mapM (iname2module modulesDb) (nub inames)
 
     -- Unapcks haskel package to the sourcedir
-    unpackModule :: FilePath -> IO (Maybe FilePath)
-    unpackModule mod' = do
-      let p = datadir</>mod'
+    unpackModule :: Maybe (Map Text Unit) -> FilePath -> IO (Maybe FilePath)
+    unpackModule _units'm package = do
+      let p = datadir </> package
       exists <- doesDirectoryExist p
       if exists
         then do
-          vprint $ "Already unpacked " <> mod'
+          vprint $ "Already unpacked " <> package
           pure (Just p)
         else
           bracket_ (setCurrentDirectory datadir) (setCurrentDirectory cwd) $
-            ( runp cabal_or_stack ["unpack", mod'] "" >> pure (Just p)
-            ) `catch`
-            (\(_ :: SomeException) ->
-              eprint ("Can't unpack " <> mod') >> pure Nothing
-            )
+            do
+              runp cabal_or_stack ["get", package] "" $> Just p
+            `catch`
+            \(e :: SomeException) -> do
+              eprint ("Can't unpack " <> package <> ": " <> show e)
+              pure Nothing
+              -- join <$> traverse tryUnpackFromCabalPlan units'm
+      -- where
+      --   tryUnpackFromCabalPlan :: Map Text Unit -> IO (Maybe FilePath)
+      --   tryUnpackFromCabalPlan units =
+      --     case M.lookup (Text.pack package) units of
+      --       Nothing -> do
+      --         vprint $ "Couldn't find " <> package <> " in cabal.plan"
+      --         pure Nothing
+      --       Just Unit{uPkgSrc=Nothing} -> do
+      --         vprint $ "No pkg-src for package " <> package
+      --         pure Nothing
+      --       Just Unit{uPkgSrc=Just ps@(LocalUnpackedPackage _path)} -> do
+      --         vprint $ "Unsupported PkgLoc: " <> show ps
+      --         pure Nothing
+      --       Just Unit{uPkgSrc=Just ps@(LocalTarballPackage _path)} -> do
+      --         vprint $ "Unsupported PkgLoc: " <> show ps
+      --         pure Nothing
+      --       Just Unit{uPkgSrc=Just ps@(RemoteTarballPackage _uri)} -> do
+      --         vprint $ "Unsupported PkgLoc: " <> show ps
+      --         pure Nothing
+      --       Just Unit{uPkgSrc=Just ps@(RepoTarballPackage (RepoLocal _path))} -> do
+      --         vprint $ "Unsupported PkgLoc: " <> show ps
+      --         pure Nothing
+      --       Just Unit{uPkgSrc=Just ps@(RepoTarballPackage (RepoRemote _uri))} -> do
+      --         vprint $ "Unsupported PkgLoc: " <> show ps
+      --         pure Nothing
+      --       Just Unit{uPkgSrc=Just ps@(RepoTarballPackage (RepoSecure (URI repoUri)))} -> do
+      --         let uri = mconcat [repoUri, "/", Text.pack package, "/",  Text.pack package, ".tar.gz"] :: Text
+      --         vprint $ "FFF: " <> uri
+      --         pure Nothing
+      --       Just Unit{uPkgSrc=Just ps@(RepoTarballPackage (RepoLocalNoIndex _path))} -> do
+      --         vprint $ "Unsupported PkgLoc: " <> show ps
+      --         pure Nothing
+      --       Just Unit{uPkgSrc=Just ps@(RemoteSourceRepoPackage _uri)} -> do
+      --         vprint $ "Unsupported PkgLoc: " <> show ps
+      --         pure Nothing
+
 
     unpackModules :: [FilePath] -> IO [FilePath]
-    unpackModules ms = catMaybes <$> mapM unpackModule ms
+    unpackModules ms = do
+      -- packages'm <- getPlanJson >>= \case
+      --   Left err -> do
+      --     vprint $ "Couldn't find plan.json - continuing..." <> "\n" <> show err
+      --     pure Nothing
+      --   Right PlanJson{pjUnits} -> do
+      --     pure . Just . fromList . map ((,) =<< (dispPkgId . uPId)) $ M.elems pjUnits
+      let packages'm = Nothing -- plan.json not supported yet
+      catMaybes <$> pooledMapConcurrentlyN (fromIntegral cli_limit_concurrency) (unpackModule packages'm) ms
+
+    -- getPlanJson :: IO (Either SomeException PlanJson)
+    -- getPlanJson = try $ decodePlanJson =<< findPlanJson (ProjectRelativeToDir ".")
 
     getFiles :: IO (Set Text)
     getFiles = do
@@ -295,7 +375,10 @@ main = withFastLogger1 (LogStdout 64) $ \logStdout -> withFastLogger1 (LogStderr
       ss_local <- mappend <$> readSourceFile <*> findSources dirs
       when (null ss_local) $
         fail $ "Haskdogs were not able to find any sources in " <> intercalate ", " dirs
-      ss_l1deps <- findModules ss_local >>= inames2modules >>= unpackModules >>= findSources
+      vprint ("Reading ghc-pkg database..." :: Text)
+      modulesDb <- load_ghc_pkgs_db
+      vprint ("Loaded ghc-pkg database" :: Text)
+      ss_l1deps <- findModules ss_local >>= inames2modules modulesDb >>= unpackModules >>= findSources
       pure $ Set.filter (/= "-") ss_local `mappend` ss_l1deps
 
     gentags :: IO ()
