@@ -34,15 +34,16 @@ Executable haskdogs
   Hs-source-dirs:       src
   Main-is:              Main.hs
   Build-depends:        base >= 4.8 && < 5
-                      , filepath
-                      , text
+                      , containers
                       , directory
+                      , fast-logger
+                      , filepath
                       , optparse-applicative
                       , process-extras
-                      , containers
-                      , hasktags
+                      , text
+                      , unliftio
 
-  Ghc-options:          -fwarn-tabs
+  Ghc-options:        -fwarn-tabs -threaded -rtsopts -Wall -freverse-errors "-with-rtsopts=-N -xn -I10 -Iw60" -Wunused-packages
 
 Source-repository head
   Type:     git
