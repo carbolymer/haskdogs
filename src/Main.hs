@@ -218,9 +218,11 @@ main = do
     -- Finds *hs in dirs, but filter-out Setup.hs
     findSources :: [FilePath] -> IO (Set Text)
     findSources [] = return Set.empty
-    findSources dirs =
-      Set.fromList . filter (not . Text.isSuffixOf "Setup.hs") . Text.lines <$>
-      runp "find" (dirs <> words "-type f -and ( -name *\\.hs -or -name *\\.lhs -or -name *\\.hsc )") ""
+    findSources dirs = do
+      mixedPaths <- map Text.unpack . filter (not . Text.isSuffixOf "Setup.hs") . Text.lines <$>
+        runp "find" (dirs <> words "-type f -and ( -name *\\.hs -or -name *\\.lhs -or -name *\\.hsc )") ""
+      -- use absolute paths because of https://github.com/MarcWeber/hasktags/issues/22
+      Set.fromList . fmap Text.pack <$> traverse canonicalizePath mixedPaths
 
     grepImports :: Text -> Maybe Text
     grepImports line =
