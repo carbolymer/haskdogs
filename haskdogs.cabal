@@ -4,7 +4,7 @@ Synopsis:            Generate tags file for Haskell project and its nearest deps
 Homepage:            http://github.com/grwlf/haskdogs
 License:             BSD3
 License-file:        LICENSE
-Author:              Sergey Mironov
+Author:              Sergei Mironov
 Maintainer:          grrwlf@gmail.com
 Category:            Development
 Build-type:          Simple
