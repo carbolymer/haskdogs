@@ -6,7 +6,7 @@ let
 
   f = { mkDerivation, base, bytestring, containers, directory
       , filepath, optparse-applicative, process-extras, stdenv, text,
-      cabal-install, hasktags
+      cabal-install, hasktags, unliftio, fast-logger
       }:
       mkDerivation {
         pname = "haskdogs";
@@ -16,7 +16,7 @@ let
         isExecutable = true;
         executableHaskellDepends = [
           base bytestring containers directory filepath optparse-applicative
-          process-extras text hasktags
+          process-extras text hasktags unliftio fast-logger
         ];
         libraryHaskellDepends = [
           cabal-install
